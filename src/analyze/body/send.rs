@@ -1067,14 +1067,6 @@ impl<'a> BodyTyper<'a> {
                 return param_value_method(method, block_ret).unwrap_or_else(|| str_method(method));
             }
         }
-        // `obj.class` is receiver-aware: our type system flattens the
-        // class object and instances onto the same `Ty::Class { id }`,
-        // so `instance_of_Base.class` returns `Ty::Class { Base }`
-        // (not the generic `Ty::Class { Class }`). Keeps the type
-        // available for chained dispatch like `self.class.table_name`.
-        // For non-class receivers (`1.class`, `"x".class`) we still
-        // hand back generic `Class` since the per-primitive metaclass
-        // isn't represented in the registry.
         // `record.becomes!(Rooms::Closed)` — Rails' STI recast. The
         // answer is named by the ARGUMENT, not the receiver, which no
         // class table can express, so it is resolved here rather than
@@ -1132,17 +1124,9 @@ impl<'a> BodyTyper<'a> {
                 }
             }
         }
+        // `obj.class` is receiver-aware; see `class_of`.
         if method.as_str() == "class" {
-            return match recv_ty {
-                Some(Ty::Class { id, args }) => Ty::Class {
-                    id: id.clone(),
-                    args: args.clone(),
-                },
-                _ => Ty::Class {
-                    id: ClassId(Symbol::from("Class")),
-                    args: vec![].into(),
-                },
-            };
+            return class_of(recv_ty);
         }
         // `freeze` / `itself` are receiver-identity: they return the
         // receiver unchanged. Receiver-aware (so they can't sit in the
@@ -2442,6 +2426,39 @@ impl<'a> BodyTyper<'a> {
         } else {
             union_many(rets)
         }
+    }
+}
+
+/// What `recv.class` answers.
+///
+/// Our type system flattens the class object and its instances onto the
+/// same `Ty::Class { id }`, so `instance_of_Base.class` is
+/// `Ty::Class { Base }` (not the generic `Class`), which keeps chained
+/// dispatch like `self.class.table_name` resolving. A union of those
+/// (`Post | Comment`, a method's parameter taking either) is the same
+/// union: each arm's class is the arm's own `Ty::Class`.
+///
+/// The generic `Class` stays for everything that really is not a model
+/// class: a nil arm (`nil.class.column_names` does raise), a primitive
+/// (`1.class`, whose metaclass the registry does not represent), and a
+/// receiver inference has not typed yet. An untyped receiver (or a union
+/// with an untyped arm) intentionally still answers the generic `Class`.
+fn class_of(recv_ty: Option<&Ty>) -> Ty {
+    let generic = || Ty::Class {
+        id: ClassId(Symbol::from("Class")),
+        args: vec![].into(),
+    };
+    match recv_ty {
+        Some(Ty::Class { id, args }) => Ty::Class {
+            id: id.clone(),
+            args: args.clone(),
+        },
+        Some(Ty::Union { variants }) if variants.iter().all(|v| matches!(v, Ty::Class { .. })) => {
+            Ty::Union {
+                variants: variants.clone(),
+            }
+        }
+        _ => generic(),
     }
 }
 

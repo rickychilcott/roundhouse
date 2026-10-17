@@ -5783,3 +5783,95 @@ fn a_private_marker_on_a_generated_enum_predicate_is_enforced() {
     let found = diagnose(&app).iter().any(|d| d.message.contains("private method `draft?` called on Article"));
     assert!(found, "{:#?}", diagnose(&app).iter().map(|d| d.message.clone()).collect::<Vec<_>>());
 }
+
+/// `recv.class` of a union of models is the union of their classes, so
+/// a class method every arm has resolves. A nil arm, or a primitive,
+/// still answers the generic `Class`: `nil.class.table_name` really
+/// raises. An untyped receiver also still answers the generic `Class`
+/// (open question: `GlobalID::Locator.locate(gid).class.reflect_on_association`
+/// stays an error), pinned here so a change to that is deliberate.
+#[test]
+fn class_of_a_model_union_is_the_union_of_their_classes() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        ),
+        (
+            "app/models/post.rb",
+            r#"class Post < ApplicationRecord
+  has_many :comments
+
+  def self.gradual(gid)
+    GlobalID::Locator.locate(gid).class.reflect_on_association(:post)
+  end
+
+  def self.union(flag)
+    record = flag ? Post.find(1) : Comment.find(1)
+    record.class.column_names
+  end
+
+  def self.nilable(flag)
+    record = flag ? Post.find(1) : nil
+    record.class.reflect_on_all_associations
+  end
+
+  def self.primitive
+    "x".class.column_names
+  end
+end
+"#,
+        ),
+        (
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  belongs_to :post\nend\n",
+        ),
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "posts", force: :cascade do |t|
+    t.string "title"
+  end
+
+  create_table "comments", force: :cascade do |t|
+    t.integer "post_id", null: false
+    t.string "body"
+  end
+end
+"#,
+        ),
+    ]);
+    let mut failures = send_dispatch_failures(&app);
+    failures.sort();
+    assert_eq!(
+        failures,
+        [
+            "column_names",
+            "reflect_on_all_associations",
+            "reflect_on_association"
+        ],
+        "the nil-armed union, the String and the untyped receiver stay errors on `Class`"
+    );
+
+    let probe = app
+        .models
+        .iter()
+        .find(|c| c.name.0.as_str() == "Post")
+        .expect("Post");
+    let body_ty = |name: &str| {
+        probe
+            .methods()
+            .find(|m| m.name.as_str() == name)
+            .expect(name)
+            .body
+            .ty
+            .clone()
+    };
+    assert_eq!(
+        body_ty("union"),
+        Some(Ty::Array {
+            elem: std::sync::Arc::new(Ty::Str)
+        }),
+        "column_names resolves on the union of the models' classes"
+    );
+}
