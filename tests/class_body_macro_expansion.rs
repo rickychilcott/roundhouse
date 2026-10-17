@@ -1466,6 +1466,44 @@ end
     assert!(!shape.contains("RateLimiter"), "the key lambda was inlined without its parameter:\n{shape}");
 }
 
+#[test]
+fn a_hyphenated_rate_limit_name_expands_without_a_survey_gap() {
+    // Rails takes any string `name:`; it only joins the cache key. The
+    // synthesized method's name is derived from it, and a hyphen there
+    // made `def rate_limit_ip-hourly-limit` fail to parse, so the whole
+    // limit was dropped with a survey gap.
+    let controller = br#"class ProbeController < ApplicationController
+  rate_limit to: 10, within: 1.hour, only: :show, name: "ip-hourly-limit"
+  def show
+    head :ok
+  end
+end
+"#;
+    let tree = std::collections::HashMap::from([
+        (std::path::PathBuf::from("app/controllers/probe_controller.rb"), controller.to_vec()),
+        (std::path::PathBuf::from("config/routes.rb"), b"Rails.application.routes.draw do\n  get \"probe\" => \"probe#show\"\nend\n".to_vec()),
+    ]);
+    roundhouse::ingest::survey::activate();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(gaps.is_empty(), "the limit should expand cleanly: {gaps:?}");
+
+    let probe = app.controllers.iter().find(|c| c.name.0.as_str() == "ProbeController").expect("controller");
+    let filter = probe
+        .body
+        .iter()
+        .find_map(|item| match item {
+            ControllerBodyItem::Filter { filter, .. } => Some(filter),
+            _ => None,
+        })
+        .expect("the rate limit is installed as a before_action");
+    assert_eq!(filter.target.as_str(), "rate_limit_ip_hourly_limit");
+    assert_eq!(filter.only.iter().map(|s| s.as_str()).collect::<Vec<_>>(), ["show"]);
+    let shape = format!("{probe:?}");
+    assert!(shape.contains("RateLimiter"), "the limiter call is in the method body:\n{shape}");
+    assert!(shape.contains("rate-limit:probe:ip-hourly-limit:"), "the key keeps the name as written:\n{shape}");
+}
+
 /// The `setup_mobile!` filters `call` expands to, as their `only` lists.
 /// `has_mobile_version(*actions)` peels its options with
 /// `extract_options!` and reads `options[:if]`.

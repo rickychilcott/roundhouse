@@ -222,6 +222,8 @@ mod nil_body_length;
 mod inline_filter_guard;
 #[path = "emit_and_run/before_action_return.rs"]
 mod before_action_return;
+#[path = "emit_and_run/rate_limit_name.rs"]
+mod rate_limit_name;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
 #[path = "support/campfire_caches.rs"]

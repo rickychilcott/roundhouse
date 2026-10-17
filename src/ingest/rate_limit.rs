@@ -221,8 +221,8 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
         }
     }
     let method = match (&name, only.as_slice()) {
-        (Some(n), _) => format!("rate_limit_{}", crate::naming::snake_case(n)),
-        (None, [one]) => format!("rate_limit_{}", one.as_str()),
+        (Some(n), _) => method_name(&crate::naming::snake_case(n)),
+        (None, [one]) => method_name(one.as_str()),
         (None, _) => "rate_limit".to_string(),
     };
     // Rails: ["rate-limit", scope || controller_path, name, by].compact.join(":")
@@ -271,6 +271,24 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
         if_cond_expr,
         unless_cond_expr,
     })
+}
+
+/// `rate_limit_<segment>` with the segment cut down to what a bare
+/// `def` can spell. Rails accepts any string `name:` because it only
+/// feeds the cache key, so `"ip-hourly-limit"` is legal there but the
+/// synthesized `def rate_limit_ip-hourly-limit` does not parse. Runs of
+/// anything outside `[A-Za-z0-9_]` become one `_`; the key keeps the raw
+/// name, and `collect_limits` numbers names that normalize alike.
+fn method_name(segment: &str) -> String {
+    let words: Vec<&str> = segment
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .flat_map(|w| w.split('_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return "rate_limit".to_string();
+    }
+    format!("rate_limit_{}", words.join("_"))
 }
 
 /// `scope:` as the cache-key segment Rails joins. A symbol or string is
@@ -413,6 +431,68 @@ mod tests {
         assert_eq!(l.key_src, "\"rate-limit:api/tokens:signup:\" + (params[:email]).to_s");
         assert_eq!(l.with_src, "head(:too_many_requests)");
         assert!(l.only.is_empty());
+    }
+
+    #[test]
+    fn a_name_a_def_cannot_spell_gets_a_method_name_it_can_and_keeps_its_key() {
+        // Rails takes any string `name:`; it only joins the cache key.
+        // The method name is ours, so it is cut down to `[a-z0-9_]`
+        // while the key keeps the name as written.
+        let c = controller(
+            "class SessionsController < ApplicationController\n  \
+             rate_limit to: 10, within: 1.hour, only: :create, name: \"ip-hourly-limit\"\n  \
+             rate_limit to: 20, within: 1.hour, only: :create, name: \"ip_hourly_limit\"\n  \
+             rate_limit to: 30, within: 1.hour, only: :create, name: \" Odd -- name!\"\nend\n",
+        );
+        let limits = collect_limits(&c);
+        let methods: Vec<&str> = limits.iter().map(|(_, l)| l.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            [
+                "rate_limit_ip_hourly_limit",
+                "rate_limit_ip_hourly_limit_2",
+                "rate_limit_odd_name"
+            ]
+        );
+        assert!(
+            limits[0].1.key_src.contains(":ip-hourly-limit:"),
+            "{}",
+            limits[0].1.key_src
+        );
+        assert!(
+            limits[1].1.key_src.contains(":ip_hourly_limit:"),
+            "{}",
+            limits[1].1.key_src
+        );
+        assert!(
+            limits[2].1.key_src.contains(": Odd -- name!:"),
+            "{}",
+            limits[2].1.key_src
+        );
+        for (_, l) in &limits {
+            let src = method_source(l);
+            assert!(src.starts_with(&format!("  def {}\n", l.method)), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_name_with_nothing_spellable_falls_back_to_the_bare_method_name() {
+        let c = controller(
+            "class SessionsController < ApplicationController\n  \
+             rate_limit to: 10, within: 1.hour, name: \"---\"\nend\n",
+        );
+        assert_eq!(collect_limits(&c)[0].1.method, "rate_limit");
+    }
+
+    #[test]
+    fn an_only_action_keeps_its_spelling_in_the_method_name() {
+        // `only: :sym` is already a method name, so the cut-down keeps
+        // its letters as written.
+        let c = controller(
+            "class SessionsController < ApplicationController\n  \
+             rate_limit to: 10, within: 1.hour, only: :createAccount\nend\n",
+        );
+        assert_eq!(collect_limits(&c)[0].1.method, "rate_limit_createAccount");
     }
 
     #[test]
