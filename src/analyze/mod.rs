@@ -4858,16 +4858,25 @@ impl Analyzer {
         // — the authentication generator's shape, in every Rails 8 app.
         let view_ctx = ClassId(Symbol::from("ActionView::Base"));
         for name in &app.view_visible_controller_methods {
-            let owners = app
+            let mut owners = app
                 .controllers
                 .iter()
                 .map(|c| &c.name)
                 .chain(app.library_classes.iter().map(|lc| &lc.name));
-            let ty = owners
-                .filter_map(|cid| self.classes.get(cid))
-                .find_map(|c| c.instance_methods.get(name).cloned());
+            // A helper that returns `self` answers its controller, not the view context it is copied onto.
+            let ty = owners.find_map(|cid| {
+                let ty = self.classes.get(cid)?.instance_methods.get(name)?;
+                Some(ty.subst_self(&Ty::Class {
+                    id: cid.clone(),
+                    args: Vec::new().into(),
+                }))
+            });
             if let Some(ty) = ty {
-                self.classes.entry(view_ctx.clone()).or_default().instance_methods.insert(name.clone(), ty);
+                self.classes
+                    .entry(view_ctx.clone())
+                    .or_default()
+                    .instance_methods
+                    .insert(name.clone(), ty);
             }
         }
     }
@@ -5400,6 +5409,11 @@ impl Analyzer {
         // call-site answer is `Page | nil`.
         if let Some(Ty::Fn { ret, .. }) = &method.signature {
             return Some((**ret).clone());
+        }
+        if method.receiver == crate::dialect::MethodReceiver::Instance
+            && returns_only_self(&method.body)
+        {
+            return Some(Ty::SelfInstance);
         }
         self.class_object_return_ty(&method.body)
             .or_else(|| tuple_return_ty(&method.body))
@@ -9562,6 +9576,18 @@ pub(crate) fn return_leaves(body: &Expr) -> Vec<&Expr> {
     tails(body, &mut out);
     returns(body, &mut out);
     out
+}
+
+/// A method whose every return value is `self`: `def with_context(c);
+/// @c = c; self; end`. It answers the RECEIVER, which an inherited
+/// call site knows and the defining class does not, so the harvest
+/// records [`Ty::SelfInstance`] (dispatch substitutes it with the
+/// class the call started from, as it does for a class-side `new`)
+/// instead of the owner. All or nothing: one arm returning anything
+/// else keeps the ordinary harvest.
+fn returns_only_self(body: &Expr) -> bool {
+    let leaves = return_leaves(body);
+    !leaves.is_empty() && leaves.iter().all(|e| matches!(&*e.node, ExprNode::SelfRef))
 }
 
 /// A method that returns a fixed-length array whose positions hold

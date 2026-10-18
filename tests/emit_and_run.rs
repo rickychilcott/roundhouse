@@ -11364,6 +11364,48 @@ raise "inherited or private method query changed" unless GuardChild.new.queries 
 "#).assert_passes();
 }
 
+/// An inherited method whose body ends in `self` answers the class it
+/// was CALLED on. It was typed as the class it was defined in, so
+/// `ArticleQuery.new.where_title("a").titles` reported `no known method
+/// `titles` on BaseQuery` for a chain Ruby runs.
+#[test]
+fn an_inherited_method_returning_self_answers_the_receiver() {
+    emit_and_run::real_blog()
+        .write(
+            "app/lib/base_query.rb",
+            r#"class BaseQuery
+  def initialize
+    @filters = []
+  end
+  def where_title(title)
+    @filters << title
+    self
+  end
+end
+"#,
+        )
+        .write(
+            "app/lib/article_query.rb",
+            r#"class ArticleQuery < BaseQuery
+  def self.titled(first, second)
+    new.where_title(first).where_title(second).titles
+  end
+  def titles
+    @filters
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+raise "chain changed" unless ArticleQuery.new.where_title("a").titles == ["a"]
+raise "chained twice changed" unless ArticleQuery.titled("a", "b") == ["a", "b"]
+raise "self was not returned" unless BaseQuery.new.where_title("a").instance_of?(BaseQuery)
+"#,
+        )
+        .assert_passes();
+}
+
 /// A routed action with a template and no method behind it: Rails runs
 /// `show` whether or not `def show` exists, so `before_action
 /// :set_article, only: %i[show …]` still feeds `articles/show`. `check`

@@ -2372,7 +2372,8 @@ impl<'a> BodyTyper<'a> {
             }
             let Some(m) = self.classes().get(&id) else { continue };
             if let Some(ty) = m.instance_methods.get(method) {
-                return Some(unwrap_fn_ret(ty));
+                // `def shout; self; end` answers the string it was called on.
+                return Some(unwrap_fn_ret(&ty.subst_self(&Ty::Str)));
             }
             stack.extend(m.includes.iter().cloned());
         }

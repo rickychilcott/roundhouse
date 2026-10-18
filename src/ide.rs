@@ -537,7 +537,12 @@ pub fn members_of(
                             Some(_) => MemberKind::Accessor,
                         }
                     };
-                    add(name, Some(ty), kind);
+                    // `-> self` found on an ancestor is the queried class's own.
+                    let receiver = Ty::Class {
+                        id: class_id.clone(),
+                        args: Vec::new().into(),
+                    };
+                    add(name, Some(&ty.subst_self(&receiver)), kind);
                 }
             }
             MemberSide::Class => {
@@ -3049,10 +3054,17 @@ pub fn candidate_signature(
     method: &Symbol,
 ) -> Option<String> {
     let info = analyzer.class_registry().get(class_id)?;
+    // A bare `instance` is only RBS in a singleton signature: on the instance side `self` is the owner.
+    let owner = Ty::Class {
+        id: class_id.clone(),
+        args: Vec::new().into(),
+    };
     let known = info
         .instance_methods
         .get(method)
-        .or_else(|| info.class_methods.get(method))?;
+        .map(|ty| ty.subst_self(&owner))
+        .or_else(|| info.class_methods.get(method).cloned())?;
+    let known = &known;
     if matches!(known, Ty::Fn { .. }) {
         return crate::rbs::print_method_signature(method.as_str(), known);
     }

@@ -255,3 +255,144 @@ end
         "the receiver should be `Readings`, not the self type; failures = {failed:?}"
     );
 }
+
+// An INSTANCE method whose body returns `self` is the same fact on the
+// other side: the defining class cannot name who will call it, so the
+// harvest records the self type and dispatch substitutes the receiver.
+
+const SELF_RETURNING_BASE: &str = r#"class Form
+  def with_context(context)
+    @context = context
+    self
+  end
+
+  def maybe(flag)
+    if flag
+      self
+    else
+      "none"
+    end
+  end
+
+  def early(flag)
+    return self if flag
+    "none"
+  end
+
+  def chain(flag)
+    return self if flag
+    self
+  end
+end
+
+class Readings < Form
+  def latest
+    "42"
+  end
+end
+"#;
+
+fn caller_of(body: &str) -> String {
+    format!("class GaugesController < ApplicationController\n  def index\n    {body}\n  end\nend\n")
+}
+
+#[test]
+fn an_inherited_method_returning_self_answers_the_subclass_that_called_it() {
+    let caller = caller_of("@label = Readings.new.with_context(1).with_context(2).latest");
+    let failed = dispatch_failures(&app(SELF_RETURNING_BASE, &caller));
+    assert!(
+        failed.is_empty(),
+        "the chain should dispatch on `Readings`; failures = {failed:?}"
+    );
+}
+
+#[test]
+fn a_method_returning_self_still_answers_the_base_when_the_base_is_the_receiver() {
+    // The substitution is the receiver, not "whatever the caller needs":
+    // `latest` is on the subclass only.
+    let caller = caller_of("@label = Form.new.with_context(1).latest");
+    let failed = dispatch_failures(&app(SELF_RETURNING_BASE, &caller));
+    assert!(
+        failed.iter().any(|f| f == "Form#latest"),
+        "`latest` is not on the base; dispatch failures = {failed:?}"
+    );
+}
+
+#[test]
+fn a_method_with_a_non_self_return_is_not_converted() {
+    // `self` on one arm and a String on the other answers a union, not
+    // the receiver; likewise a `return self` guard in front of a
+    // different tail. Only a method whose EVERY return is `self` is the
+    // receiver-dependent kind.
+    let owned = files(SELF_RETURNING_BASE, &caller_of("@label = 1"));
+    let borrowed: Vec<(&str, &str)> = owned.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = borrowed
+        .iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    let mut analyzer = Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let form = roundhouse::ClassId(roundhouse::Symbol::new("Form"));
+    let answer = |name: &str| {
+        analyzer.class_registry()[&form].instance_methods[&roundhouse::Symbol::new(name)].clone()
+    };
+    use roundhouse::ty::Ty;
+    assert_eq!(answer("with_context"), Ty::SelfInstance);
+    assert_eq!(
+        answer("chain"),
+        Ty::SelfInstance,
+        "every return is `self`, early or not"
+    );
+    assert_ne!(answer("maybe"), Ty::SelfInstance);
+    assert_ne!(answer("early"), Ty::SelfInstance);
+
+    // What emit reads is the signature stamped on the def, and a bare
+    // self type there is refused by the typed targets: it names the
+    // owner instead.
+    let stamped = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name == form)
+        .and_then(|lc| {
+            lc.methods
+                .iter()
+                .find(|m| m.name.as_str() == "with_context")
+        })
+        .and_then(|m| m.signature.clone());
+    match stamped {
+        Some(Ty::Fn { ret, .. }) => assert_eq!(
+            *ret,
+            Ty::Class {
+                id: form,
+                args: Vec::new().into()
+            }
+        ),
+        other => panic!("expected a stamped signature, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_module_method_returning_self_answers_the_includer() {
+    let source = r#"module Chainable
+  def with_context(context)
+    @context = context
+    self
+  end
+end
+
+class Readings
+  include Chainable
+
+  def latest
+    "42"
+  end
+end
+"#;
+    let caller = caller_of("@label = Readings.new.with_context(1).latest");
+    let failed = dispatch_failures(&app(source, &caller));
+    assert!(
+        failed.is_empty(),
+        "the includer should answer its own instance; failures = {failed:?}"
+    );
+}
