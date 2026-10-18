@@ -2181,7 +2181,7 @@ end
     super::channel_callbacks::lower_channel_names(&mut app);
     super::on_load_reopen::apply_pending(&mut app);
     splice_concerns_into_models(&mut app);
-    splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
+    splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans)?;
     super::acts_as_votable::expand_acts_as_votable(&mut app)?;
     // After the splice: `include Discard::Model` can arrive through a concern.
     super::discard::expand_discard_models(&mut app)?;
@@ -2702,10 +2702,20 @@ pub(super) fn concern_class_method_catalog(
 /// copy is unreachable there rather than wrong (nothing calls
 /// `Message::Attachment.create_with_attachment!`). Removing it would
 /// mean rewriting library-class emit for no behavioural gain.
+///
+/// `included do; class << self; def x` is a fourth spelling of the same
+/// class side, but not the same precedence. Its defs run at include time as
+/// singleton methods of the includer itself, so a later definition in the
+/// includer replaces them (the includer's own wins, as above) while an
+/// earlier one is replaced BY them, and they outrank any extended
+/// `ClassMethods`. Only the first of those is what "the includer's own wins"
+/// models. A name where an `included do` def loses that contest here is
+/// ledgered as a gap, never guessed, except for the common shape of an
+/// `include` line followed by the includer's own override.
 fn splice_concern_class_methods_into_includers(
     app: &mut App,
     carriers: &[ConcernClassMethodSpans],
-) {
+) -> IngestResult<()> {
     use crate::dialect::ModelBodyItem;
     use crate::ident::{ClassId, Symbol};
     use std::collections::{HashMap, HashSet};
@@ -2719,12 +2729,21 @@ fn splice_concern_class_methods_into_includers(
         }
     }
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
+    let included_do: HashSet<&crate::span::Span> = carriers
+        .iter()
+        .flat_map(|c| &c.included_do_methods)
+        .collect();
+    let carrier_files: HashMap<&ClassId, &str> = carriers
+        .iter()
+        .filter(|c| !c.included_do_methods.is_empty())
+        .map(|c| (&c.owner, c.file.as_str()))
+        .collect();
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
     for lc in &app.library_classes {
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
     }
     if class_side.is_empty() {
-        return;
+        return Ok(());
     }
 
     // A complete bridge may precede or follow the actual carrier in a
@@ -2752,12 +2771,21 @@ fn splice_concern_class_methods_into_includers(
                 queue.extend(nested.iter().cloned());
             }
         }
+        let own = taken.clone();
         let mut added = Vec::new();
         let mut provenance: HashMap<Symbol, ClassId> = HashMap::new();
+        let mut lost: Vec<IncludedDoLoss> = Vec::new();
         for concern in &order {
             let Some((methods, consts)) = class_side.get(concern) else { continue };
             for m in methods {
                 if !taken.insert(m.name.clone()) {
+                    if included_do.contains(&m.name_span) {
+                        lost.push(IncludedDoLoss {
+                            concern: concern.clone(),
+                            name: m.name.clone(),
+                            to_own: own.contains(&m.name),
+                        });
+                    }
                     continue;
                 }
                 provenance.insert(m.name.clone(), concern.clone());
@@ -2773,7 +2801,29 @@ fn splice_concern_class_methods_into_includers(
                 added.push(m);
             }
         }
-        (added, provenance)
+        (added, provenance, lost)
+    };
+    let ledger_loss = |includer: &ClassId, loss: &IncludedDoLoss| {
+        survey::continue_or_fail(IngestError::Unsupported {
+            file: carrier_files
+                .get(&loss.concern)
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+            message: format!(
+                "`{concern}` defines class method `{name}` in `included do; class << self`, and `{includer}` \
+                 also gets `{name}` from {from}; Rails runs the `included do` definition at include time, so \
+                 which one wins depends on source order, which is not modeled (the other one is kept)",
+                concern = loss.concern.0,
+                name = loss.name,
+                includer = includer.0,
+                from = if loss.to_own {
+                    "its own definition"
+                } else {
+                    "another concern"
+                },
+            ),
+        })
     };
 
     let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::new();
@@ -2782,7 +2832,13 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance) = copies(crate::analyze::model_includes(model), taken);
+        let (added, provenance, lost) = copies(crate::analyze::model_includes(model), taken);
+        for loss in lost
+            .iter()
+            .filter(|loss| !(loss.to_own && own_override_follows_include(model, loss)))
+        {
+            ledger_loss(&model.name, loss)?;
+        }
         model.body.extend(added.into_iter().map(|method| ModelBodyItem::Method {
             method,
             leading_comments: Vec::new(),
@@ -2800,13 +2856,42 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance) = copies(lc.includes.clone(), taken);
+        let (added, provenance, lost) = copies(lc.includes.clone(), taken);
+        for loss in &lost {
+            ledger_loss(&lc.name, loss)?;
+        }
         lc.methods.extend(added);
         if !provenance.is_empty() {
             spliced.insert(lc.name.clone(), provenance);
         }
     }
     app.concern_spliced_class_methods = spliced;
+    Ok(())
+}
+
+/// An `included do; class << self` method that did not become the includer's:
+/// something else already had the name.
+struct IncludedDoLoss {
+    concern: crate::ident::ClassId,
+    name: Symbol,
+    /// Lost to the includer's own definition, not another concern's.
+    to_own: bool,
+}
+
+/// Does the model define the lost method itself AFTER the `include` line
+/// that names the concern? Then Ruby ran the concern's `included` block
+/// first and the model's own `def self.x` replaced its result, which is
+/// what keeping the model's definition models.
+fn own_override_follows_include(model: &crate::dialect::Model, loss: &IncludedDoLoss) -> bool {
+    use crate::dialect::ModelBodyItem;
+    let include_at = model.body.iter().position(|item| {
+        crate::analyze::body_includes(std::slice::from_ref(item)).contains(&loss.concern)
+    });
+    let override_at = model.body.iter().rposition(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.receiver == MethodReceiver::Class && method.name == loss.name)
+    });
+    matches!((include_at, override_at), (Some(include), Some(own)) if include.lt(&own))
 }
 
 /// A routed action with a template and no method behind it gets the

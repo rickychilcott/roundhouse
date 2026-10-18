@@ -1934,6 +1934,101 @@ pub(super) fn included_hook_class_methods_body<'pr>(
     sc.body()
 }
 
+/// The bodies of the `class << self` statements written directly in a
+/// receiverless `included do … end` block — the fourth spelling of a
+/// concern's class side, beside `class_methods do`, `module ClassMethods`
+/// and the `def self.included(klass); class << klass` hook above.
+///
+/// ActiveSupport::Concern evaluates the block with `class_eval` on the
+/// includer, so `self` there IS the includer and `class << self` opens the
+/// includer's own singleton: `Includer.foo`. The defs inside are therefore
+/// class-side methods, as with `class_methods do`, with one difference
+/// `splice_concern_class_methods_into_includers` accounts for: they run at
+/// include time and are singleton methods of the includer itself, so they
+/// outrank an extended `ClassMethods` of any concern.
+///
+/// Only direct statements count. A `class << self` under an `if`, a
+/// `with_options`, or any other wrapper is not claimed here;
+/// [`nested_included_do_singleton`] finds those so they are reported.
+///
+/// Each body comes with the byte range of its statement, so a caller that
+/// keeps the rest of the block can take the claimed statements out of it.
+pub(super) fn included_do_singleton_bodies<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+) -> Vec<(Option<ruby_prism::Node<'pr>>, std::ops::Range<u32>)> {
+    if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+        return Vec::new();
+    }
+    let Some(body) = call
+        .block()
+        .and_then(|b| b.as_block_node())
+        .and_then(|b| b.body())
+    else {
+        return Vec::new();
+    };
+    flatten_statements(body)
+        .iter()
+        .filter_map(|stmt| stmt.as_singleton_class_node())
+        .filter(|sc| sc.expression().as_self_node().is_some())
+        .map(|sc| {
+            let at = sc.location();
+            (sc.body(), at.start_offset() as u32..at.end_offset() as u32)
+        })
+        .collect()
+}
+
+/// Drop the nested-`def` refusal from the sites inside `claimed`: those
+/// defs were taken as class methods, so the residual block that is kept
+/// must not report them a second time. A def anywhere else keeps its
+/// refusal.
+fn release_claimed_defs(expr: &mut Expr, claimed: &[std::ops::Range<u32>]) {
+    let within = |span: &Span| {
+        claimed
+            .iter()
+            .any(|r| r.start <= span.start && span.end <= r.end)
+    };
+    if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+        if construct.as_str() == crate::diagnostic::NESTED_DEF)
+        && within(&expr.span)
+    {
+        expr.diagnostic = None;
+    }
+    expr.node
+        .for_each_child_mut(&mut |child| release_claimed_defs(child, claimed));
+}
+
+/// Does this `included do` block hold a `class << self` that
+/// [`included_do_singleton_bodies`] does not claim — under an `if`, a
+/// `with_options`, a nested block? Its defs would reach no includer, so the
+/// caller records a gap instead of letting them vanish. A `def` body is not
+/// searched: a singleton opened at call time is not a declaration.
+fn nested_included_do_singleton(call: &ruby_prism::CallNode<'_>) -> bool {
+    struct Nested {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Nested {
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            self.found |= node.expression().as_self_node().is_some();
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+    }
+    let Some(body) = call
+        .block()
+        .and_then(|b| b.as_block_node())
+        .and_then(|b| b.body())
+    else {
+        return false;
+    };
+    let mut nested = Nested { found: false };
+    for stmt in flatten_statements(body)
+        .iter()
+        .filter(|stmt| stmt.as_singleton_class_node().is_none())
+    {
+        ruby_prism::Visit::visit(&mut nested, stmt);
+    }
+    nested.found
+}
+
 fn included_hook_parameter(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let receiver = def.receiver()?;
     receiver.as_self_node()?;
@@ -2367,6 +2462,34 @@ fn walk_decl_body_with_visibility<'pr>(
                 if kw == "class_methods" {
                     if let Some(block) = call.block().and_then(|blk| blk.as_block_node()) {
                         out.extend(walk_decl_body_with_visibility(block.body(), owner, file, DeclBodyMode::ClassMethods, visibility)?);
+                        continue;
+                    }
+                }
+                // `included do; class << self; def x; end; end; end` — the
+                // block runs on the includer, so its singleton is the
+                // includer's: the same class-side methods `class_methods do`
+                // declares. The block itself still falls through to the
+                // unknown-call capture below, as it always did.
+                if kw == "included" && mode == DeclBodyMode::Instance {
+                    let claimed = included_do_singleton_bodies(&call);
+                    if !claimed.is_empty() {
+                        let ranges: Vec<_> =
+                            claimed.iter().map(|(_, range)| range.clone()).collect();
+                        for (singleton_body, _) in claimed {
+                            out.extend(walk_decl_body_with_visibility(
+                                singleton_body,
+                                owner,
+                                file,
+                                DeclBodyMode::ClassMethods,
+                                visibility,
+                            )?);
+                        }
+                        // The rest of the block is kept as the unknown call
+                        // it always was, minus the defs claimed above.
+                        if let Ok(mut residual) = ingest_expr(&stmt, file) {
+                            release_claimed_defs(&mut residual, &ranges);
+                            out.unknown_calls.push(residual);
+                        }
                         continue;
                     }
                 }
@@ -3688,6 +3811,13 @@ pub fn ingest_helper_method_names(source: &[u8]) -> Vec<Symbol> {
 pub struct ConcernClassMethodSpans {
     pub owner: ClassId,
     pub methods: Vec<Span>,
+    /// The subset of `methods` written in `included do; class << self`.
+    /// Those are singleton methods of the includer itself, run at include
+    /// time, so they outrank any extended carrier and trade places with the
+    /// includer's own definitions by source order — unlike the rest.
+    pub included_do_methods: Vec<Span>,
+    /// The file the carrier was read from, for gaps reported against it.
+    pub file: String,
     pub bridges: Vec<Span>,
     pub has_nested_carrier: bool,
     /// Literal framework identity and calls that require it to be installed.
@@ -3730,6 +3860,7 @@ pub fn ingest_concern_class_method_spans(
 
         let Some(body) = module.body() else { continue };
         let mut spans: Vec<Span> = Vec::new();
+        let mut included_do_spans: Vec<Span> = Vec::new();
         let mut bridges: Vec<Span> = Vec::new();
         let mut has_nested_carrier = false;
         let mut concern_extensions = Vec::new();
@@ -3774,6 +3905,11 @@ pub fn ingest_concern_class_method_spans(
                         defs_in(block.body(), file, &mut spans);
                     }
                 }
+                for (singleton_body, _) in included_do_singleton_bodies(&call) {
+                    let before = spans.len();
+                    defs_in(singleton_body, file, &mut spans);
+                    included_do_spans.extend_from_slice(&spans[before..]);
+                }
             }
             // `def self.included(klass); class << klass ... end; end` —
             // see `included_hook_class_methods_body`'s doc comment. The
@@ -3806,6 +3942,8 @@ pub fn ingest_concern_class_method_spans(
             out.push(ConcernClassMethodSpans {
                 owner: id,
                 methods: spans,
+                included_do_methods: included_do_spans,
+                file: file.to_string(),
                 bridges,
                 has_nested_carrier,
                 concern_extensions,
@@ -4521,9 +4659,30 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             let direct = flatten_statements(block_body);
             let block_start = items.len();
             let mut unclaimed = false;
+            if nested_included_do_singleton(&call) {
+                super::survey::record(&IngestError::Unsupported {
+                    file: file.into(),
+                    message: "`class << self` nested inside an `included do` block (under a conditional, \
+                              `with_options`, or another wrapper) is not modeled: its class methods reach no includer"
+                        .into(),
+                });
+                unclaimed = true;
+            }
             let mut stmts = Vec::new();
             walk_dsl_stmts(block.body().unwrap(), &mut stmts);
             for inner in stmts {
+                // A direct `class << self` is the includer's class side,
+                // claimed whole by the library-class walk and the carrier
+                // spans; none of it is a model item.
+                if inner
+                    .as_singleton_class_node()
+                    .is_some_and(|sc| sc.expression().as_self_node().is_some())
+                    && direct.iter().any(|stmt| {
+                        stmt.location().start_offset() == inner.location().start_offset()
+                    })
+                {
+                    continue;
+                }
                 // `has_many :x, ... if self == Account`: `included do`
                 // runs with `self` bound to the includer, so the guard
                 // is a fact each includer answers. Carry the statement's

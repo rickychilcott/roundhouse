@@ -8514,6 +8514,124 @@ fn included_hook_class_methods_run() {
         .assert_passes();
 }
 
+/// The fourth spelling of a concern's class side: `class << self` written
+/// directly in `included do`. Rails evaluates that block on the includer,
+/// so the defs are `Article.label_for`. Before the fix they reached no
+/// includer and `check` said nothing about it: the emitted module was empty
+/// and the call raised NoMethodError. The body is receiver-relative
+/// (`name`) so a copy typed against the wrong class would show.
+#[test]
+fn included_do_class_self_methods_run() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/labelled.rb",
+            "module Labelled\n  \
+               extend ActiveSupport::Concern\n\n  \
+               included do\n    \
+                 class << self\n      \
+                   def label_for(action) = \"article #{action}\"\n    \
+                 end\n  \
+               end\n\
+             end\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  include Labelled\n\n  \
+             has_many :comments, dependent: :destroy",
+        )
+        .write(
+            "test/models/article_labelled_test.rb",
+            "require \"test_helper\"\n\n\
+             class ArticleLabelledTest < ActiveSupport::TestCase\n  \
+               test \"a class << self method from included do is callable on the includer\" do\n    \
+                 assert_equal \"article create\", Article.label_for(:create)\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/article_labelled_test.rb")
+        .assert_passes();
+}
+
+/// The same concern included on `ApplicationRecord` reaches each model
+/// through inheritance, and its body runs against the model it is called
+/// on, not the class that carried it.
+#[test]
+fn included_do_class_self_methods_on_application_record_run() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/labelled.rb",
+            "module Labelled\n  \
+               extend ActiveSupport::Concern\n\n  \
+               included do\n    \
+                 class << self\n      \
+                   def label_for(action) = \"#{name.downcase} #{action}\"\n    \
+                 end\n  \
+               end\n\
+             end\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n  include Labelled\nend\n",
+        )
+        .write(
+            "test/models/application_record_labelled_test.rb",
+            "require \"test_helper\"\n\n\
+             class ApplicationRecordLabelledTest < ActiveSupport::TestCase\n  \
+               test \"a subclass answers the inherited class << self method for itself\" do\n    \
+                 assert_equal \"article create\", Article.label_for(:create)\n    \
+                 assert_equal \"comment show\", Comment.label_for(:show)\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/application_record_labelled_test.rb")
+        .assert_passes();
+}
+
+/// Precedence when the includer defines the same class method after its
+/// `include` line: the `included do` definition runs first, at include
+/// time, and the includer's own `def self.` replaces it. Its sibling model
+/// keeps the concern's.
+#[test]
+fn included_do_class_self_method_yields_to_a_later_own_definition() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/labelled.rb",
+            "module Labelled\n  \
+               extend ActiveSupport::Concern\n\n  \
+               included do\n    \
+                 class << self\n      \
+                   def label_for(action) = \"concern #{action}\"\n    \
+                 end\n  \
+               end\n\
+             end\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            "class Article < ApplicationRecord\n  include Labelled\n\n  \
+             def self.label_for(action) = \"own #{action}\"\n\n  \
+             has_many :comments, dependent: :destroy",
+        )
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord",
+            "class Comment < ApplicationRecord\n  include Labelled\n",
+        )
+        .write(
+            "test/models/labelled_precedence_test.rb",
+            "require \"test_helper\"\n\n\
+             class LabelledPrecedenceTest < ActiveSupport::TestCase\n  \
+               test \"the includer's later definition wins; another includer keeps the concern's\" do\n    \
+                 assert_equal \"own create\", Article.label_for(:create)\n    \
+                 assert_equal \"concern create\", Comment.label_for(:create)\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/labelled_precedence_test.rb")
+        .assert_passes();
+}
+
 /// `scope :x, (lambda do |v| … end)` — Procore's `reports/app/models/
 /// report.rb` wraps the spelled-out `lambda`/`proc` scope body in its
 /// own parens (`for_tools`, `for_data_sets`, `shared`). Before the fix
