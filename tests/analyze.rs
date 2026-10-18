@@ -5783,3 +5783,68 @@ fn a_private_marker_on_a_generated_enum_predicate_is_enforced() {
     let found = diagnose(&app).iter().any(|d| d.message.contains("private method `draft?` called on Article"));
     assert!(found, "{:#?}", diagnose(&app).iter().map(|d| d.message.clone()).collect::<Vec<_>>());
 }
+
+/// A gap in `ApplicationController` shadows what the controllers it
+/// parents seed into their views, not a mailer's templates: no controller
+/// renders those. `params.fetch` inside the mailer leaves `@header`
+/// untyped, a real error that the gap must not demote to a coverage note.
+/// A view no ingested controller feeds (`@report`) still reads as shadowed:
+/// that is the case the conventional-path fallback exists for.
+#[test]
+fn a_gap_in_application_controller_demotes_controller_views_but_not_mailer_views() {
+    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  protect_from_forgery with: CsrfStrategy\nend\n",
+        ),
+        (
+            "app/controllers/posts_controller.rb",
+            "class PostsController < ApplicationController\n  def index\n    NotesMailer.with(header: \"h\").one.deliver_later\n    render plain: \"ok\"\n  end\nend\n",
+        ),
+        ("app/mailers/application_mailer.rb", "class ApplicationMailer < ActionMailer::Base\nend\n"),
+        (
+            "app/mailers/notes_mailer.rb",
+            "class NotesMailer < ApplicationMailer\n  def one\n    @header = params.fetch(:header)\n    mail(to: \"x@example.com\", subject: \"x\")\n  end\nend\n",
+        ),
+        ("app/views/notes_mailer/one.text.erb", "<%= @header %>\n"),
+        ("app/views/reports/show.html.erb", "<%= @report %>\n"),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :posts, only: :index\nend\n",
+        ),
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.0].define(version: 1) do\n  create_table \"posts\" do |t|\n    t.string \"title\"\n  end\nend\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    roundhouse::ingest::survey::activate();
+    let result = roundhouse::ingest::ingest_app_from_tree(tree);
+    let gaps = roundhouse::ingest::survey::drain();
+    let mut app = result.expect("ingest tree");
+    assert_eq!(gaps.len(), 1, "only the forgery macro is a gap: {gaps:#?}");
+    Analyzer::new(&app).analyze(&mut app);
+    let mut diags = diagnose(&app);
+    roundhouse::analyze::attribution::attribute_ingest_gaps(&mut diags, &app, &gaps);
+    let severity_of = |ivar: &str| {
+        let found: Vec<_> = diags
+            .iter()
+            .filter(|d| matches!(&d.kind, DiagnosticKind::IvarUnresolved { name } if name.as_str() == ivar))
+            .collect();
+        assert_eq!(found.len(), 1, "{ivar}: {diags:#?}");
+        found[0].severity
+    };
+    use roundhouse::analyze::Severity;
+    assert_eq!(
+        severity_of("header"),
+        Severity::Error,
+        "the mailer template's error stays an error"
+    );
+    assert_eq!(
+        severity_of("report"),
+        Severity::Info,
+        "the feeder-less controller view is still shadowed"
+    );
+}

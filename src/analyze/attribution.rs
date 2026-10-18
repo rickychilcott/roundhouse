@@ -30,6 +30,8 @@
 //!    gap. A Rails-convention path fallback covers views whose feeder
 //!    didn't ingest at all (a wholly-skipped controller file never
 //!    registers, so no feeder edge exists to consult).
+//!    Mailer templates are exempt from that fallback: no controller renders them,
+//!    so a controller's gap cannot have shadowed them.
 //! 4. **Gap-declared constant** — an unsupported constant whose class or
 //!    module a gap file declares: survey mode may drop such a class whole,
 //!    and every reference to it then reports the constant. The reads of an
@@ -235,6 +237,9 @@ struct AttributionCtx<'a> {
     /// Whether any controller at all is tainted — the layout rule
     /// (layouts are fed by every controller).
     any_controller_tainted: Option<&'a str>,
+    /// View directories of the app's mailers (`notes_mailer`): templates no
+    /// controller renders, so no controller's gap can have shadowed them.
+    mailer_view_dirs: HashSet<String>,
     /// Namespace (fully qualified) → gap path, for every `class` / `module`
     /// a gap file declares. Survey mode may drop such a class wholesale, and
     /// each reference to it then reports an unsupported constant.
@@ -342,6 +347,11 @@ impl<'a> AttributionCtx<'a> {
             .find_map(|c| tainted_classes.get(&c.name))
             .copied();
 
+        let mailer_view_dirs = super::mailer_class_names(app)
+            .iter()
+            .map(super::mailer_view_dir)
+            .collect();
+
         let mut gap_namespaces: HashMap<String, &str> = HashMap::new();
         let mut gap_receivers: HashMap<String, &str> = HashMap::new();
         let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
@@ -379,6 +389,7 @@ impl<'a> AttributionCtx<'a> {
             tainted_classes,
             view_by_file,
             any_controller_tainted,
+            mailer_view_dirs,
             gap_namespaces,
             gap_receivers,
             resolver,
@@ -427,6 +438,11 @@ impl<'a> AttributionCtx<'a> {
                 return self.gap_by_path.get(*path);
             }
         }
+        // A mailer's templates are rendered by the mailer, never by a
+        // controller, so no controller's gap can have shadowed them.
+        if self.is_mailer_view(view.as_str()) {
+            return None;
+        }
         // Fallback for views with no (surviving) feeder: Rails
         // convention maps the view directory to its controller path —
         // covers controllers whose file skipped ingest wholesale and so
@@ -442,6 +458,10 @@ impl<'a> AttributionCtx<'a> {
             }
         }
         None
+    }
+
+    fn is_mailer_view(&self, view: &str) -> bool {
+        view.rsplit_once('/').is_some_and(|(dir, _)| self.mailer_view_dirs.contains(dir))
     }
 
     /// Taint for a dispatch receiver: the root class of `ty` (unions:
@@ -915,5 +935,27 @@ mod tests {
                 "app/controllers/application_controller.rb".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn mailer_view_dirs_cover_nested_mailers_and_leave_controller_views_alone() {
+        use std::path::PathBuf;
+        let tree: HashMap<PathBuf, Vec<u8>> = [
+            ("app/mailers/application_mailer.rb", "class ApplicationMailer < ActionMailer::Base\nend\n"),
+            ("app/mailers/notes_mailer.rb", "class NotesMailer < ApplicationMailer\n  def one\n    mail(to: 'x')\n  end\nend\n"),
+            ("app/mailers/admin/digest_mailer.rb", "class Admin::DigestMailer < ApplicationMailer\n  def one\n    mail(to: 'x')\n  end\nend\n"),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+        ]
+        .into_iter()
+        .map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec()))
+        .collect();
+        let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+        let ctx = AttributionCtx::build(&app, &[]);
+        assert!(ctx.is_mailer_view("notes_mailer/one"));
+        assert!(ctx.is_mailer_view("notes_mailer/_footer"));
+        assert!(ctx.is_mailer_view("admin/digest_mailer/one"));
+        assert!(!ctx.is_mailer_view("admin/one"));
+        assert!(!ctx.is_mailer_view("posts/index"));
+        assert!(!ctx.is_mailer_view("notes_mailer"));
     }
 }

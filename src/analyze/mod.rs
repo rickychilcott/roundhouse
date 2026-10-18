@@ -3756,36 +3756,7 @@ impl Analyzer {
         // Identify mailers by parent chain up front; the harvest itself
         // rides the library-class typing loop below, after each method
         // body has been typed once.
-        let mailer_names: std::collections::HashSet<ClassId> = {
-            let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
-                .library_classes
-                .iter()
-                .map(|lc| (&lc.name, lc.parent.as_ref()))
-                .collect();
-            app.library_classes
-                .iter()
-                .filter(|lc| {
-                    let mut cur = Some(&lc.name);
-                    let mut depth = 0usize;
-                    while let Some(id) = cur {
-                        // `Devise::Mailer` is itself an ActionMailer
-                        // subclass living in the gem — app mailers that
-                        // extend it (Mastodon's UserMailer) dead-end
-                        // there, so accept it as a terminal too.
-                        if matches!(id.0.as_str(), "ActionMailer::Base" | "Devise::Mailer") {
-                            return true;
-                        }
-                        depth += 1;
-                        if depth > 32 {
-                            break;
-                        }
-                        cur = parent_of.get(id).copied().flatten();
-                    }
-                    false
-                })
-                .map(|lc| lc.name.clone())
-                .collect()
-        };
+        let mailer_names = mailer_class_names(app);
 
         // A `CurrentAttributes` ivar is written from OUTSIDE the class,
         // through the class-level forwarder `ingest::current_attributes`
@@ -3980,13 +3951,7 @@ impl Analyzer {
             }
 
             if mailer_names.contains(&lc_name) {
-                let prefix = lc_name
-                    .0
-                    .as_str()
-                    .split("::")
-                    .map(crate::naming::snake_case)
-                    .collect::<Vec<_>>()
-                    .join("/");
+                let prefix = mailer_view_dir(&lc_name);
                 for method in &lc.methods {
                     if method.receiver != crate::dialect::MethodReceiver::Instance
                         || method.kind != crate::dialect::AccessorKind::Method
@@ -8648,6 +8613,51 @@ fn collect_attr_accessor_names(body: &[ModelBodyItem]) -> Vec<Symbol> {
         }
     }
     out
+}
+
+/// The app's ActionMailer subclasses, by parent chain through the
+/// ingested library classes.
+pub(crate) fn mailer_class_names(app: &App) -> std::collections::HashSet<ClassId> {
+    let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
+        .library_classes
+        .iter()
+        .map(|lc| (&lc.name, lc.parent.as_ref()))
+        .collect();
+    app.library_classes
+        .iter()
+        .filter(|lc| {
+            let mut cur = Some(&lc.name);
+            let mut depth = 0usize;
+            while let Some(id) = cur {
+                // `Devise::Mailer` is itself an ActionMailer
+                // subclass living in the gem — app mailers that
+                // extend it (Mastodon's UserMailer) dead-end
+                // there, so accept it as a terminal too.
+                if matches!(id.0.as_str(), "ActionMailer::Base" | "Devise::Mailer") {
+                    return true;
+                }
+                depth += 1;
+                if depth > 32 {
+                    break;
+                }
+                cur = parent_of.get(id).copied().flatten();
+            }
+            false
+        })
+        .map(|lc| lc.name.clone())
+        .collect()
+}
+
+/// The view directory a mailer's actions render from:
+/// `Admin::UserMailer` → `admin/user_mailer`.
+pub(crate) fn mailer_view_dir(mailer: &ClassId) -> String {
+    mailer
+        .0
+        .as_str()
+        .split("::")
+        .map(crate::naming::snake_case)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `Mailer.with(k: v, …)` call sites across the app, folded to one
