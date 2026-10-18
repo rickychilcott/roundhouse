@@ -236,6 +236,8 @@ mod ordinalize;
 mod autoload_once_paths;
 #[path = "emit_and_run/config_require_relative.rs"]
 mod config_require_relative;
+#[path = "emit_and_run/config_application_constants.rs"]
+mod config_application_constants;
 #[path = "emit_and_run/defined_const_fold.rs"]
 mod defined_const_fold;
 #[path = "emit_and_run/job_payload.rs"]

@@ -878,8 +878,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // `domain`) reached at runtime as `Rails.application.<m>`. Reparent
     // onto `Rails::Application` itself: the runtime shim memoizes
     // `Rails::Application.new`, so a reopen makes the methods reachable
-    // regardless of require order, and the app namespace (never
-    // referenced at runtime) drops out. Same isolate-per-file tolerance
+    // regardless of require order, and the `Application` class itself
+    // drops out. The namespace module around it does not: its constants
+    // and `def self.` helpers are ingested as library-class content
+    // (`Stoked::SUPPORT_EMAIL`). Same isolate-per-file tolerance
     // as extras/lib — the file carries Bundler/railtie noise that must
     // not abort ingest.
     // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
@@ -899,16 +901,23 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         // real config surface (lobsters keeps read_only?/name/domain
         // there, outside the class body).
         let class_methods = match ingest_library_classes(&source, &file) {
-            Ok(classes) => classes
-                .into_iter()
-                .find(|lc| {
+            Ok(classes) => {
+                let (application, rest): (Vec<_>, Vec<_>) = classes.into_iter().partition(|lc| {
                     lc.parent
                         .as_ref()
-                        .map(|p| p.0.as_str() == "Rails::Application")
-                        .unwrap_or(false)
-                })
-                .map(|lc| lc.methods)
-                .unwrap_or_default(),
+                        .is_some_and(|p| p.0.as_str() == "Rails::Application")
+                });
+                // Everything else in the file is app code that Rails runs
+                // before any initializer: the namespace module's constants
+                // and `def self.` helpers (`Stoked::SUPPORT_EMAIL`), read
+                // anywhere as ordinary library-class content.
+                app.library_classes.extend(rest);
+                application
+                    .into_iter()
+                    .next()
+                    .map(|lc| lc.methods)
+                    .unwrap_or_default()
+            }
             Err(err) => {
                 if survey::is_active() {
                     survey::record(&err);
@@ -1034,8 +1043,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         // wrapping `class Application < Rails::Application`
         // (`Campfire` -> "campfire"). Synthesized as an override on the
         // Application reopen, the same shape as `session_cookie_key`
-        // above; the namespace itself is dropped at ingest, so without
-        // this the name is gone by emit time.
+        // above; the namespace module is kept for its constants and
+        // helpers, but its name reaches emit only through this override.
         if let Some(name) = extract_app_namespace(&source) {
             let app_name = crate::naming::underscore(&name);
             if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
