@@ -9676,6 +9676,48 @@ raise unless LedgerEntry.find(prefixed_decoy.id).title == "Prefixed decoy"
         .assert_passes();
 }
 
+/// A class nested under a concrete model is stored in the parent's
+/// singular table name plus its own plural (`Article::Note` lives in
+/// `article_notes`), not in the demodulized `notes`. The emitted readers
+/// and SQL must follow the same table the analyzer resolved, and the
+/// conventional `notes` table behind a top-level `Note` stays untouched.
+#[test]
+fn a_model_nested_under_a_model_runs_against_the_parents_prefixed_table() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "  add_foreign_key \"comments\", \"articles\"",
+            r#"  create_table "article_notes" do |t|
+    t.string "title"
+    t.text "body"
+  end
+  create_table "notes" do |t|
+    t.string "title"
+    t.text "body"
+  end
+  add_foreign_key "comments", "articles""#,
+        )
+        .write("app/models/article/note.rb", "class Article::Note < ApplicationRecord\nend\n")
+        .write("app/models/note.rb", "class Note < ApplicationRecord\nend\n")
+        .run_ruby(
+            r#"raise Article::Note.table_name.inspect unless Article::Note.table_name == "article_notes"
+raise Note.table_name.inspect unless Note.table_name == "notes"
+decoy = Note.create!(title: "Conventional decoy", body: "Leave untouched")
+note = Article::Note.create!(title: "Original", body: "A long enough body")
+raise unless Article::Note.count == 1
+raise unless Article::Note.find(note.id).title == "Original"
+note.update!(title: "Changed")
+raise unless Article::Note.find(note.id).title == "Changed"
+raise unless Note.count == 1
+raise unless Note.find(decoy.id).title == "Conventional decoy"
+note.destroy!
+raise unless Article::Note.count == 0
+raise unless Note.count == 1
+"#,
+        )
+        .assert_passes();
+}
+
 /// Not only `Model.scope`: a scope the target model inherits from an abstract base answers on an association reaching it too.
 #[test]
 fn an_inherited_scope_answers_on_an_association() {

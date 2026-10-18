@@ -36,6 +36,9 @@ pub type TablePrefixes = std::collections::HashMap<String, String>;
 mod enum_constants;
 pub(in crate::ingest) use enum_constants::EnumConstants;
 
+mod table_names;
+pub(in crate::ingest) use table_names::{ModelDecls, TableNames};
+
 /// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`,
 /// or the same def inside the module's `class << self`.
 /// Deliberately narrow: only a module-level singleton def whose body is a
@@ -234,17 +237,17 @@ pub fn ingest_model(
     constants.record(source, file);
     constants.finish();
     let bases = super::library_class::ModelBases::new();
-    ingest_model_with_enum_constants(source, file, schema, prefixes, &TablePrefixes::default(), &constants, &bases)
+    ingest_model_with_enum_constants(source, file, schema, prefixes, &TableNames::default(), &constants, &bases)
 }
 
-/// `base_prefixes`: each abstract base's inherited `table_name_prefix`
-/// ([`inherited_table_prefixes`]).
+/// `table_names`: the cross-file table-name inputs
+/// ([`ModelDecls::resolve`]).
 pub(super) fn ingest_model_with_enum_constants(
     source: &[u8],
     file: &str,
     schema: &Schema,
     prefixes: &TablePrefixes,
-    base_prefixes: &TablePrefixes,
+    table_names: &TableNames,
     enum_constants: &EnumConstants,
     model_bases: &super::library_class::ModelBases,
 ) -> IngestResult<Option<Model>> {
@@ -281,29 +284,19 @@ pub(super) fn ingest_model_with_enum_constants(
     let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
     let table_name = if let Some((name, _)) = &table_decl {
         name.clone()
+    } else if let Some(nested) = table_names.nested.get(class_name.as_str()) {
+        nested.clone()
     } else {
-        let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
-        segments.pop();
-        let mut prefix = class.body().and_then(explicit_table_prefix).unwrap_or_default();
-        let mut from_module = false;
-        while prefix.is_empty() && !segments.is_empty() {
-            if let Some(p) = prefixes.get(&segments.join("::")) {
-                prefix = p.clone();
-                from_module = true;
-                break;
-            }
-            segments.pop();
-        }
-        // No module parent declares one (an empty one still counts): the
-        // class attribute its abstract base set.
-        if prefix.is_empty()
-            && !from_module
-            && let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n))
-            && let Some(inherited) = base_prefixes.get(&model_bases.resolve_superclass(&scope, &parent))
-        {
-            prefix = inherited.clone();
-        }
-        format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))
+        let inherited = class
+            .superclass()
+            .and_then(|n| constant_path_of(&n))
+            .and_then(|parent| {
+                table_names
+                    .base_prefixes
+                    .get(&model_bases.resolve_superclass(&scope, &parent))
+            });
+        let own_prefix = class.body().and_then(explicit_table_prefix);
+        table_names::conventional_table_name(class_name.as_str(), own_prefix, prefixes, inherited)
     };
 
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {

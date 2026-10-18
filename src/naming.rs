@@ -436,11 +436,17 @@ pub fn pluralize_snake(class_name: &str) -> String {
 }
 
 /// Rails' `undecorated_table_name`: DEMODULIZE, then underscore, then
-/// pluralize. A namespaced model does NOT get its namespace folded into
-/// the table name — `Push::Subscription` is `subscriptions`, not
+/// pluralize. A module namespace does NOT get folded into the table
+/// name — `Push::Subscription` is `subscriptions`, not
 /// `push_subscriptions`. The `push_` in campfire's schema comes from
 /// `Push.table_name_prefix`, which is a separate, opt-in declaration
 /// (see `Model::table` construction in `ingest::model`).
+///
+/// This is only the class's own part. A class nested under a concrete
+/// model is stored in `<parent's singular table>_<this>`
+/// (`Community::Advocate` is `community_advocates` when `Community` is
+/// a model); that needs the parent's declaration, so it is resolved
+/// across files in `ingest::model::table_names`.
 ///
 /// Feeding the qualified name to `pluralize_snake` produces
 /// `push::subscriptions`, which cannot name a table — so the model
