@@ -4199,11 +4199,13 @@ fn record_concern_csp_divergence(stmt: &ruby_prism::Node<'_>, file: &str) {
 /// `App::concern_model_items`) exactly like the model's own
 /// declarations. Only the DSL shapes (associations, scopes,
 /// validations, callbacks) are kept — arbitrary statements stay with
-/// the module. `with_options … do` wrappers are descended (their
-/// kwargs refine defaults — `dependent:`, `inverse_of:` — that don't
-/// affect the association's type); an item the classifier rejects is
-/// survey-recorded and skipped so one exotic line doesn't cost the
-/// rest of the block.
+/// the module. `with_options … do` wrappers are descended and their
+/// options merged into the associations inside (`dependent:` decides
+/// whether the includer cascades a destroy). A block that holds anything
+/// but associations is declined whole with a `with_options:` gap, since
+/// its statements without the options would mean something else. An item
+/// the classifier rejects is survey-recorded and skipped so one exotic
+/// line doesn't cost the rest of the block.
 /// True when an Unknown body item is a receiverless block-form call to
 /// a lifecycle hook the callback lowering handles.
 fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
@@ -4369,21 +4371,49 @@ fn includer_guard_classes(cond: &crate::expr::Expr) -> Option<(Vec<String>, bool
     }
 }
 
+/// A statement of an `included do` body, with the `with_options` calls
+/// (those that pass options) it sits inside, outermost first.
+type WrappedStmt<'pr> = (
+    ruby_prism::Node<'pr>,
+    Vec<std::rc::Rc<ruby_prism::Node<'pr>>>,
+);
+
 fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::Node<'pr>>) {
+    let mut wrapped = Vec::new();
+    walk_wrapped_dsl_stmts(body, &[], &mut wrapped);
+    out.extend(wrapped.into_iter().map(|(stmt, _)| stmt));
+}
+
+/// The statements of `body` with `with_options … do` blocks descended,
+/// each paired with the option-passing `with_options` calls around it.
+/// Descending alone is not enough: those options change what the inner
+/// declaration means, so a caller that keeps the statement must apply
+/// them (`model::association_in_with_options`) or decline it. A
+/// `with_options do` without arguments passes nothing and wraps nothing.
+fn walk_wrapped_dsl_stmts<'pr>(
+    body: ruby_prism::Node<'pr>,
+    wrappers: &[std::rc::Rc<ruby_prism::Node<'pr>>],
+    out: &mut Vec<WrappedStmt<'pr>>,
+) {
     for stmt in flatten_statements(body) {
-        if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none()
-                && constant_id_str(&call.name()) == "with_options"
-            {
-                if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
-                    if let Some(inner) = block.body() {
-                        walk_dsl_stmts(inner, out);
-                    }
-                    continue;
-                }
-            }
+        let Some(call) = stmt.as_call_node() else {
+            out.push((stmt, wrappers.to_vec()));
+            continue;
+        };
+        let inner = (call.receiver().is_none() && constant_id_str(&call.name()) == "with_options")
+            .then(|| call.block().and_then(|b| b.as_block_node()))
+            .flatten();
+        let Some(block) = inner else {
+            out.push((stmt, wrappers.to_vec()));
+            continue;
+        };
+        let mut nested = wrappers.to_vec();
+        if call.arguments().is_some() {
+            nested.push(std::rc::Rc::new(stmt));
         }
-        out.push(stmt);
+        if let Some(inner_body) = block.body() {
+            walk_wrapped_dsl_stmts(inner_body, &nested, out);
+        }
     }
 }
 
@@ -4522,8 +4552,51 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             let block_start = items.len();
             let mut unclaimed = false;
             let mut stmts = Vec::new();
-            walk_dsl_stmts(block.body().unwrap(), &mut stmts);
-            for inner in stmts {
+            let mut composed_blocks: HashMap<usize, bool> = HashMap::new();
+            walk_wrapped_dsl_stmts(block.body().unwrap(), &[], &mut stmts);
+            for (inner, wrappers) in stmts {
+                // Under `with_options OPTS do`, only an association can
+                // take OPTS, and the block is composed whole or not at
+                // all (as in a model body). Anything else would be
+                // carried without them (a validation losing its `if:`),
+                // so the block is declined, once. Accessors keep their
+                // own refusal below.
+                if let Some(outer) = wrappers.first() {
+                    let outer_start = outer.location().start_offset();
+                    let verdict = composed_blocks.entry(outer_start).or_insert_with(|| {
+                        let verdict = super::model::check_with_options_composes(outer, &id, file);
+                        if let Err(err) = &verdict {
+                            super::survey::record(err);
+                        }
+                        verdict.is_ok()
+                    });
+                    let composes = *verdict;
+                    let accessor = inner.as_call_node().is_some_and(|c| {
+                        c.receiver().is_none()
+                            && matches!(
+                                constant_id_str(&c.name()),
+                                "attr_accessor" | "attr_reader" | "attr_writer"
+                            )
+                    });
+                    if !composes && !accessor {
+                        unclaimed = true;
+                        continue;
+                    }
+                    if composes {
+                        let wrappers: Vec<&ruby_prism::Node<'_>> =
+                            wrappers.iter().map(|w| &**w).collect();
+                        match super::model::association_in_with_options(
+                            &inner, &id, file, &wrappers,
+                        ) {
+                            Ok(item) => items.push(item),
+                            Err(err) => {
+                                super::survey::record(&err);
+                                unclaimed = true;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 // `has_many :x, ... if self == Account`: `included do`
                 // runs with `self` bound to the includer, so the guard
                 // is a fact each includer answers. Carry the statement's

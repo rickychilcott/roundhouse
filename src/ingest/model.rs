@@ -737,6 +737,24 @@ pub(super) fn ingest_model_body_items(
                     })
                     .collect());
             }
+            // `with_options dependent: :destroy do has_many :comments end`
+            // — every association inside gets the options merged in.
+            // All or nothing: a statement that can't be composed whole
+            // is recorded as a gap and stays the Unknown it always was,
+            // never half-registered.
+            if name == "with_options" && call.arguments().is_some() {
+                let mut composed = Vec::new();
+                match with_options_associations(&call, owner, file, &mut Vec::new(), &mut composed)
+                {
+                    Ok(()) => {
+                        if let Some(first) = composed.first_mut() {
+                            *first.leading_comments_mut() = leading_comments;
+                        }
+                        return Ok(composed);
+                    }
+                    Err(err) => super::survey::record(&err),
+                }
+            }
             // `cattr_*` / `mattr_*` — same class-attr expansion library
             // ingest applies. Plain `attr_*` stays Unknown: concern
             // `included` blocks share this walker, and expanding those
@@ -765,6 +783,194 @@ pub(super) fn ingest_model_body_items(
         }
     }
     Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?])
+}
+
+fn with_options_gap(file: &str, detail: &str) -> IngestError {
+    IngestError::Unsupported {
+        file: file.into(),
+        message: format!("with_options: {detail}"),
+    }
+}
+
+/// The `key: value` elements of a `with_options` call's literal option
+/// hash, for a call this ingester can read: block form, no block
+/// parameter, exactly one hash argument with symbol keys and no splat.
+fn with_options_elements<'a>(
+    call: &ruby_prism::CallNode<'a>,
+    file: &str,
+) -> IngestResult<Vec<Node<'a>>> {
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else {
+        return Err(with_options_gap(file, "only the block form is composed"));
+    };
+    if block.parameters().is_some() {
+        return Err(with_options_gap(
+            file,
+            "a block with a parameter (`|options|`) is not composed",
+        ));
+    }
+    let args: Vec<Node<'a>> = call
+        .arguments()
+        .map(|a| a.arguments().iter().collect())
+        .unwrap_or_default();
+    let [options] = args.as_slice() else {
+        return Err(with_options_gap(
+            file,
+            "expects exactly one literal option hash",
+        ));
+    };
+    let elements = if let Some(hash) = options.as_keyword_hash_node() {
+        hash.elements()
+    } else if let Some(hash) = options.as_hash_node() {
+        hash.elements()
+    } else {
+        return Err(with_options_gap(file, "options must be a literal hash"));
+    };
+    let literal = elements.iter().all(|el| {
+        el.as_assoc_node()
+            .is_some_and(|assoc| symbol_value(&assoc.key()).is_some())
+    });
+    if !literal {
+        return Err(with_options_gap(
+            file,
+            "options must be a literal hash with symbol keys and no splat",
+        ));
+    }
+    Ok(elements.iter().collect())
+}
+
+fn is_with_options_call(call: &ruby_prism::CallNode<'_>) -> bool {
+    call.receiver().is_none() && constant_id_str(&call.name()) == "with_options"
+}
+
+/// Associations declared inside `with_options OPTS do … end`, with OPTS
+/// merged into each one (ActiveSupport's `OptionMerger`: the call's own
+/// keys win). `inherited` carries the enclosing blocks' options, outermost
+/// first; nested `with_options` compose. Every statement in the block must
+/// be an association macro, or the whole statement is declined.
+fn with_options_associations<'a>(
+    call: &ruby_prism::CallNode<'a>,
+    owner: &ClassId,
+    file: &str,
+    inherited: &mut Vec<Node<'a>>,
+    out: &mut Vec<ModelBodyItem>,
+) -> IngestResult<()> {
+    let own = with_options_elements(call, file)?;
+    let depth = inherited.len();
+    inherited.extend(own);
+    let body = call
+        .block()
+        .and_then(|b| b.as_block_node())
+        .and_then(|b| b.body());
+    for stmt in body.map(flatten_statements).unwrap_or_default() {
+        let Some(inner) = stmt.as_call_node().filter(|c| c.receiver().is_none()) else {
+            return Err(with_options_gap(
+                file,
+                "only association macros are composed",
+            ));
+        };
+        if is_with_options_call(&inner) {
+            with_options_associations(&inner, owner, file, inherited, out)?;
+        } else {
+            out.push(association_with_options(
+                &stmt, &inner, owner, file, inherited,
+            )?);
+        }
+    }
+    inherited.truncate(depth);
+    Ok(())
+}
+
+fn association_with_options(
+    stmt: &Node<'_>,
+    call: &ruby_prism::CallNode<'_>,
+    owner: &ClassId,
+    file: &str,
+    inherited: &[Node<'_>],
+) -> IngestResult<ModelBodyItem> {
+    let method = constant_id_str(&call.name());
+    if !matches!(
+        method,
+        "has_many" | "has_one" | "belongs_to" | "has_and_belongs_to_many"
+    ) {
+        return Err(with_options_gap(
+            file,
+            &format!("`{method}` is not an association macro; only associations are composed"),
+        ));
+    }
+    // The call's own options must be a plain keyword list: a braced hash
+    // is not read as options, and a `**splat` could shadow a merged key.
+    for arg in call
+        .arguments()
+        .map(|a| a.arguments().iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let opaque = arg.as_hash_node().is_some()
+            || arg.as_keyword_hash_node().is_some_and(|hash| {
+                hash.elements()
+                    .iter()
+                    .any(|el| el.as_assoc_node().is_none())
+            });
+        if opaque {
+            return Err(with_options_gap(
+                file,
+                &format!("`{method}` with a braced hash or `**splat` option is not composed"),
+            ));
+        }
+    }
+    let Some(assoc) = parse_association(call, owner, method, file, inherited) else {
+        return Err(with_options_gap(
+            file,
+            &format!("`{method}` without a literal symbol name is not composed"),
+        ));
+    };
+    Ok(ModelBodyItem::Association {
+        assoc,
+        leading_blank_line: false,
+        leading_comments: Vec::new(),
+        span: Span {
+            file: super::sources::file_id(file),
+            start: stmt.location().start_offset() as u32,
+            end: stmt.location().end_offset() as u32,
+        },
+    })
+}
+
+/// Whether the `with_options` call `wrapper` composes whole: the same
+/// all-or-nothing test a model body gets.
+pub(super) fn check_with_options_composes(
+    wrapper: &Node<'_>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<()> {
+    let call = wrapper
+        .as_call_node()
+        .expect("wrappers are with_options calls");
+    with_options_associations(&call, owner, file, &mut Vec::new(), &mut Vec::new())
+}
+
+/// An association statement found inside non-empty `with_options` blocks of
+/// a concern's `included do`. `wrappers` are those `with_options` calls,
+/// outermost first; their options are merged into the association.
+pub(super) fn association_in_with_options<'a>(
+    stmt: &Node<'a>,
+    owner: &ClassId,
+    file: &str,
+    wrappers: &[&Node<'a>],
+) -> IngestResult<ModelBodyItem> {
+    let mut inherited = Vec::new();
+    for wrapper in wrappers {
+        let call = wrapper
+            .as_call_node()
+            .expect("wrappers are with_options calls");
+        inherited.extend(with_options_elements(&call, file)?);
+    }
+    let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none()) else {
+        return Err(with_options_gap(
+            file,
+            "only association macros are composed",
+        ));
+    };
+    association_with_options(stmt, &call, owner, file, &inherited)
 }
 
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
@@ -1035,7 +1241,7 @@ pub(super) fn ingest_model_body_item(
             });
         }
         let method = constant_id_str(&call.name()).to_string();
-        if let Some(assoc) = parse_association(&call, owner, &method, file) {
+        if let Some(assoc) = parse_association(&call, owner, &method, file, &[]) {
             return Ok(ModelBodyItem::Association { assoc, leading_blank_line: false, leading_comments, span });
         }
         // `validate :method_name, :other` — the CUSTOM-validator form,
@@ -2847,14 +3053,111 @@ fn parse_length_rule(value: &ruby_prism::Node<'_>) -> Option<crate::dialect::Val
     }
 }
 
+/// The options an association macro reads, accumulated in call order so
+/// a later `key: value` replaces an earlier one (Ruby's own hash
+/// semantics, and `with_options`' "the call's keys win").
+#[derive(Default)]
+struct AssociationOptions {
+    class_name: Option<String>,
+    foreign_key: Option<String>,
+    primary_key: Option<String>,
+    through: Option<String>,
+    source: Option<String>,
+    source_type: Option<String>,
+    dependent: Option<crate::dialect::Dependent>,
+    optional: Option<bool>,
+    join_table: Option<String>,
+    scope: Option<crate::expr::Expr>,
+    polymorphic: Option<bool>,
+    as_interface: Option<String>,
+    belongs_to_default: Option<crate::expr::Expr>,
+    touch: Option<crate::dialect::Touch>,
+    autosave: Option<bool>,
+}
+
+impl AssociationOptions {
+    /// One `key: value` element of an options hash. Anything that is
+    /// not a symbol-keyed pair (a `**splat`) is skipped.
+    fn apply(&mut self, element: &Node<'_>, file: &str) {
+        use super::util::{bool_value, string_value};
+        let Some(assoc) = element.as_assoc_node() else {
+            return;
+        };
+        let Some(key) = symbol_value(&assoc.key()) else {
+            return;
+        };
+        let value = assoc.value();
+        match key.as_str() {
+            // `"::Portal"` names the top-level class `Portal`; kept as written it is a class no one defines.
+            "class_name" => {
+                self.class_name =
+                    string_value(&value).map(|s| s.trim_start_matches("::").to_string())
+            }
+            "foreign_key" => {
+                self.foreign_key = string_value(&value).or_else(|| symbol_value(&value))
+            }
+            "primary_key" => {
+                self.primary_key = string_value(&value).or_else(|| symbol_value(&value))
+            }
+            "through" => self.through = symbol_value(&value),
+            "source" => self.source = symbol_value(&value),
+            "source_type" => {
+                self.source_type =
+                    string_value(&value).map(|s| s.trim_start_matches("::").to_string())
+            }
+            "dependent" => {
+                self.dependent = symbol_value(&value).and_then(|s| dependent_from_sym(&s))
+            }
+            "optional" => self.optional = bool_value(&value),
+            // `touch: true` / `touch: :last_message_at`. A `false`
+            // is Rails' explicit opt-out and reads as no touch,
+            // which is what `None` already means.
+            "touch" => {
+                self.touch = match bool_value(&value) {
+                    Some(true) => Some(crate::dialect::Touch::UpdatedAt),
+                    Some(false) => None,
+                    None => symbol_value(&value)
+                        .map(|s| crate::dialect::Touch::Column(Symbol::from(s.as_str()))),
+                }
+            }
+            "join_table" => self.join_table = string_value(&value),
+            "polymorphic" => self.polymorphic = bool_value(&value),
+            "as" => self.as_interface = symbol_value(&value),
+            "autosave" => self.autosave = bool_value(&value),
+            // `default: -> { Current.user }` — the lambda BODY, not
+            // the lambda. Rails calls it with `instance_exec`, so
+            // the body is already written against the record; a
+            // param-taking form would need the record threaded and
+            // nothing in the corpus writes one.
+            "default" => {
+                self.belongs_to_default = value
+                    .as_lambda_node()
+                    .filter(|l| {
+                        l.parameters()
+                            .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
+                            .map(|pn| pn.requireds().iter().next().is_none())
+                            .unwrap_or(true)
+                    })
+                    .and_then(|l| l.body())
+                    .and_then(|b| ingest_expr(&b, file).ok());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `inherited` holds the `key: value` elements of the enclosing
+/// `with_options` hashes, outermost first. They are applied before the
+/// call's own keyword hash, so the call's keys win, as `OptionMerger`'s
+/// `deep_merge` orders them.
 fn parse_association(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     method: &str,
     file: &str,
+    inherited: &[Node<'_>],
 ) -> Option<crate::dialect::Association> {
-    use super::util::{bool_value, string_value};
-    use crate::dialect::{Association, Dependent};
+    use crate::dialect::Association;
 
     let args = call.arguments()?;
     let all_args = args.arguments();
@@ -2863,22 +3166,10 @@ fn parse_association(
     let name_str = symbol_value(&first)?;
     let name = Symbol::from(name_str.as_str());
 
-    let mut class_name: Option<String> = None;
-    let mut foreign_key: Option<String> = None;
-    let mut primary_key: Option<String> = None;
-    let mut through: Option<String> = None;
-    let mut source: Option<String> = None;
-    let mut source_type: Option<String> = None;
-    let mut dependent: Option<Dependent> = None;
-    let mut optional: Option<bool> = None;
-    let mut join_table: Option<String> = None;
-    let mut scope: Option<crate::expr::Expr> = None;
-    let mut polymorphic: Option<bool> = None;
-    let mut as_interface: Option<String> = None;
-    let mut belongs_to_default: Option<crate::expr::Expr> = None;
-    let mut touch: Option<crate::dialect::Touch> = None;
-    let mut autosave: Option<bool> = None;
-
+    let mut options = AssociationOptions::default();
+    for element in inherited {
+        options.apply(element, file);
+    }
     for arg in iter {
         // Positional lambda between name and kwargs — the association
         // scope (`has_many :x, -> { where(...) }, through: :y`).
@@ -2887,75 +3178,40 @@ fn parse_association(
         // owner-dependent scopes) are skipped — they need the owner
         // threaded and no exercised corpus does this yet.
         if let Some(lambda) = arg.as_lambda_node() {
-            if scope.is_none() {
+            if options.scope.is_none() {
                 let param_free = lambda
                     .parameters()
                     .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
                     .map(|pn| pn.requireds().iter().next().is_none())
                     .unwrap_or(true);
                 if param_free {
-                    scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
+                    options.scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
                 }
             }
             continue;
         }
         let Some(kh) = arg.as_keyword_hash_node() else { continue };
         for el in kh.elements().iter() {
-            let Some(assoc) = el.as_assoc_node() else { continue };
-            let Some(key) = symbol_value(&assoc.key()) else { continue };
-            let value = assoc.value();
-            match key.as_str() {
-                // `"::Portal"` names the top-level class `Portal`; kept as written it is a class no one defines.
-                "class_name" => class_name = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
-                "foreign_key" => {
-                    foreign_key = string_value(&value).or_else(|| symbol_value(&value))
-                }
-                "primary_key" => {
-                    primary_key = string_value(&value).or_else(|| symbol_value(&value))
-                }
-                "through" => through = symbol_value(&value),
-                "source" => source = symbol_value(&value),
-                "source_type" => source_type = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
-                "dependent" => {
-                    dependent = symbol_value(&value).and_then(|s| dependent_from_sym(&s))
-                }
-                "optional" => optional = bool_value(&value),
-                // `touch: true` / `touch: :last_message_at`. A `false`
-                // is Rails' explicit opt-out and reads as no touch,
-                // which is what `None` already means.
-                "touch" => {
-                    touch = match bool_value(&value) {
-                        Some(true) => Some(crate::dialect::Touch::UpdatedAt),
-                        Some(false) => None,
-                        None => symbol_value(&value)
-                            .map(|s| crate::dialect::Touch::Column(Symbol::from(s.as_str()))),
-                    }
-                }
-                "join_table" => join_table = string_value(&value),
-                "polymorphic" => polymorphic = bool_value(&value),
-                "as" => as_interface = symbol_value(&value),
-                "autosave" => autosave = bool_value(&value),
-                // `default: -> { Current.user }` — the lambda BODY, not
-                // the lambda. Rails calls it with `instance_exec`, so
-                // the body is already written against the record; a
-                // param-taking form would need the record threaded and
-                // nothing in the corpus writes one.
-                "default" => {
-                    belongs_to_default = value
-                        .as_lambda_node()
-                        .filter(|l| {
-                            l.parameters()
-                                .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
-                                .map(|pn| pn.requireds().iter().next().is_none())
-                                .unwrap_or(true)
-                        })
-                        .and_then(|l| l.body())
-                        .and_then(|b| ingest_expr(&b, file).ok());
-                }
-                _ => {}
-            }
+            options.apply(&el, file);
         }
     }
+    let AssociationOptions {
+        class_name,
+        foreign_key,
+        primary_key,
+        through,
+        source,
+        source_type,
+        dependent,
+        optional,
+        join_table,
+        scope,
+        polymorphic,
+        as_interface,
+        belongs_to_default,
+        touch,
+        autosave,
+    } = options;
 
     let foreign_key_explicit = foreign_key.is_some();
 

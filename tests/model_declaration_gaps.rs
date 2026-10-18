@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use roundhouse::analyze::{Analyzer, attribution::attribute_ingest_gaps, diagnose};
 use roundhouse::diagnostic::{DiagnosticKind, Severity};
-use roundhouse::dialect::ModelBodyItem;
+use roundhouse::dialect::{Association, Dependent, ModelBodyItem};
 use roundhouse::expr::ExprNode;
 use roundhouse::ingest::{IngestError, ingest_app_from_tree, survey};
 
@@ -233,4 +233,142 @@ fn declaration_reporting_preserves_original_ingest_failures() {
             .any(|(_, message)| strict_error.to_string().contains(message)),
         "original body failure recorded after the declaration: {strict_error}"
     );
+}
+
+fn model<'a>(app: &'a roundhouse::App, name: &str) -> &'a roundhouse::dialect::Model {
+    app.models
+        .iter()
+        .find(|model| model.name.0.as_str() == name)
+        .expect(name)
+}
+
+fn association<'a>(model: &'a roundhouse::dialect::Model, name: &str) -> Option<&'a Association> {
+    model
+        .associations()
+        .find(|assoc| assoc.name().as_str() == name)
+}
+
+/// `with_options` merges its hash into each association inside, the call's
+/// own keys winning, and nested blocks compose, in a model body and in a
+/// concern's `included do` alike.
+#[test]
+fn with_options_merges_into_each_association_and_the_calls_keys_win() {
+    let body = r#"
+  with_options dependent: :destroy, class_name: "Remark" do
+    has_many :comments, class_name: "Note"
+    has_many :replies, dependent: :nullify
+    with_options foreign_key: :post_id do
+      has_one :cover
+      belongs_to :section
+    end
+  end
+"#;
+    let app = ingest_app_from_tree(tree(
+        &format!("class Article < ApplicationRecord{body}end\n"),
+        &format!(
+            "module Workflow\n  extend ActiveSupport::Concern\n  included do{body}  end\nend\n"
+        ),
+    ))
+    .expect("ingest");
+    for owner in ["Article", "Ticket"] {
+        let model = model(&app, owner);
+        let Some(Association::HasMany {
+            target, dependent, ..
+        }) = association(model, "comments")
+        else {
+            panic!("{owner}: comments is not a has_many");
+        };
+        assert_eq!(
+            (target.0.as_str(), dependent),
+            ("Note", &Dependent::Destroy),
+            "{owner}: own class_name wins"
+        );
+        let Some(Association::HasMany {
+            target, dependent, ..
+        }) = association(model, "replies")
+        else {
+            panic!("{owner}: replies is not a has_many");
+        };
+        assert_eq!(
+            (target.0.as_str(), dependent),
+            ("Remark", &Dependent::Nullify),
+            "{owner}: own dependent wins"
+        );
+        let Some(Association::HasOne {
+            target,
+            foreign_key,
+            dependent,
+            ..
+        }) = association(model, "cover")
+        else {
+            panic!("{owner}: cover is not a has_one");
+        };
+        assert_eq!(
+            (target.0.as_str(), foreign_key.as_str(), dependent),
+            ("Remark", "post_id", &Dependent::Destroy),
+            "{owner}: nested blocks compose"
+        );
+        let Some(Association::BelongsTo {
+            target,
+            foreign_key,
+            ..
+        }) = association(model, "section")
+        else {
+            panic!("{owner}: section is not a belongs_to");
+        };
+        assert_eq!(
+            (target.0.as_str(), foreign_key.as_str()),
+            ("Remark", "post_id"),
+            "{owner}"
+        );
+    }
+}
+
+/// A `with_options` block that holds anything but association macros is
+/// not composed: it is recorded as a gap and registers nothing, rather than
+/// registering the associations without the options or the validation
+/// without its `if:`.
+#[test]
+fn with_options_around_other_declarations_is_a_gap_and_registers_nothing() {
+    let body = r#"
+  with_options if: :published? do
+    has_many :comments
+    validates :title, presence: true
+  end
+"#;
+    let files = tree(
+        &format!("class Article < ApplicationRecord{body}end\n"),
+        &format!(
+            "module Workflow\n  extend ActiveSupport::Concern\n  included do{body}  end\nend\n"
+        ),
+    );
+    ingest_app_from_tree(files.clone()).expect("strict ingest declines without failing");
+    survey::activate();
+    let result = ingest_app_from_tree(files);
+    let gaps = survey::drain();
+    let app = result.expect("survey ingest");
+    let actual = entries(&gaps);
+    let want =
+        "with_options: `validates` is not an association macro; only associations are composed";
+    for file in ["app/models/article.rb", "app/models/concerns/workflow.rb"] {
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|entry| **entry == (file, want))
+                .count(),
+            1,
+            "{file}: {actual:?}"
+        );
+    }
+    for owner in ["Article", "Ticket"] {
+        let model = model(&app, owner);
+        assert!(
+            association(model, "comments").is_none(),
+            "{owner}: the association must not register"
+        );
+        assert!(
+            model.validations().next().is_none(),
+            "{owner}: the validation must not register unconditionally"
+        );
+    }
 }
